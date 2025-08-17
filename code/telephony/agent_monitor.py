@@ -1,0 +1,113 @@
+"""
+Dynamic agent connection timeout monitor
+"""
+import asyncio
+import time
+import logging
+import json
+
+logger = logging.getLogger(__name__)
+
+
+class AgentConnectionMonitor:
+    """Monitors agent connection and drops call if agent doesn't connect within timeout"""
+    
+    def __init__(self, websocket_handler, timeout_seconds=5):
+        self.websocket_handler = websocket_handler
+        self.timeout_seconds = timeout_seconds
+        self.agent_connected = False
+        self.monitoring_task = None
+        self.timeout_reached = False
+        self.monitoring_active = True
+        
+    async def start_monitoring(self):
+        """Start monitoring for agent connection"""
+        logger.info(f"⏰ Starting agent connection monitor - {self.timeout_seconds}s timeout")
+        
+        # Start the timeout task
+        self.monitoring_task = asyncio.create_task(self._monitor_agent_connection())
+        
+        return self.monitoring_task
+    
+    async def _monitor_agent_connection(self):
+        """Monitor for agent connection with timeout"""
+        start_time = time.time()
+        
+        try:
+            while time.time() - start_time < self.timeout_seconds and self.monitoring_active:
+                # Check if agent has connected
+                if self.websocket_handler.agent_participant is not None:
+                    self.agent_connected = True
+                    elapsed = time.time() - start_time
+                    logger.info(f"✅ Agent connected in {elapsed:.2f}s - call will continue")
+                    return True
+                
+                # Check every 0.1 seconds
+                await asyncio.sleep(0.1)
+            
+            # Only drop call if monitoring is still active (not cancelled due to cleanup)
+            if self.monitoring_active:
+                # Timeout reached
+                self.timeout_reached = True
+                elapsed = time.time() - start_time
+                logger.warning(f"⏰ Agent connection timeout after {elapsed:.2f}s - dropping call")
+                
+                # Drop the call
+                await self._drop_call_no_agent()
+                return False
+            
+            return self.agent_connected
+            
+        except asyncio.CancelledError:
+            logger.info("🔄 Agent connection monitoring cancelled")
+            return self.agent_connected
+        except Exception as e:
+            logger.error(f"❌ Error in agent connection monitoring: {e}")
+            return False
+    
+    async def _drop_call_no_agent(self):
+        """Drop the call because no agent connected"""
+        logger.info("📞 Dropping call - no agent available")
+        
+        try:
+            # Send a message to Plivo that no agent is available (optional)
+            if (hasattr(self.websocket_handler, 'websocket') and 
+                hasattr(self.websocket_handler.websocket, 'send')):
+                try:
+                    logger.info("📢 Notifying caller that no agent is available")
+                    # You could implement a brief audio message here if needed
+                    
+                except Exception as e:
+                    logger.error(f"❌ Error sending no-agent message: {e}")
+            
+            # Close the WebSocket connection cleanly
+            if hasattr(self.websocket_handler, 'websocket'):
+                try:
+                    await self.websocket_handler.websocket.close(
+                        code=1000, 
+                        reason="No agent available"
+                    )
+                    logger.info("✅ WebSocket closed - no agent available")
+                except Exception as e:
+                    logger.error(f"❌ Error closing WebSocket: {e}")
+            
+            # Trigger cleanup of the handler
+            if hasattr(self.websocket_handler, 'cleanup'):
+                logger.info("🧹 Triggering handler cleanup due to no agent")
+                await self.websocket_handler.cleanup()
+                
+        except Exception as e:
+            logger.error(f"❌ Error dropping call: {e}")
+    
+    def notify_agent_connected(self):
+        """Called when an agent connects"""
+        if not self.timeout_reached and self.monitoring_active:
+            self.agent_connected = True
+            logger.info("🤖 Agent connection confirmed by monitor")
+    
+    def stop_monitoring(self):
+        """Stop the monitoring task"""
+        self.monitoring_active = False
+        if self.monitoring_task and not self.monitoring_task.done():
+            logger.info("🔄 Stopping agent connection monitor...")
+            self.monitoring_task.cancel()

@@ -1,5 +1,5 @@
 """
-HTTP server for API endpoints and Plivo webhooks
+Fixed HTTP server for API endpoints and Plivo webhooks
 """
 import asyncio
 import time
@@ -17,11 +17,14 @@ logger = logging.getLogger(__name__)
 
 
 class HTTPServerManager:
-    """Manages HTTP server and API endpoints"""
+    """Manages HTTP server and API endpoints - FIXED VERSION"""
     
     def __init__(self):
         self.agent_manager = AgentManager()
         self.app = self._create_app()
+        self.runner = None
+        self.site = None
+        self.shutdown_event = asyncio.Event()
     
     def _create_app(self):
         """Create web application with routes"""
@@ -77,13 +80,50 @@ class HTTPServerManager:
             return web.json_response({"error": str(e)}, status=400)
 
     async def _handle_plivo_xml(self, request):
-        """Return Plivo XML for call flow"""
+        """Return Plivo XML for call flow - FIXED TO PASS ALL PARAMETERS"""
         try:
             # Get room name from query parameters
             room = request.query.get("room", f"plivo-room-{uuid.uuid4()}")
-            logger.info(f"📋 Generating Plivo XML for room: {room}")
             
-            # Plivo XML response for audio streaming
+            # Get ALL query parameters to pass to WebSocket
+            query_params = []
+            
+            # Always include room
+            query_params.append(f"room={room}")
+            
+            # Add agent parameter if specified
+            if "agent" in request.query:
+                agent_name = request.query["agent"]
+                query_params.append(f"agent={agent_name}")
+                logger.info(f"📋 Agent specified in URL: {agent_name}")
+            
+            # Add background noise parameters if specified
+            if "bg_noise" in request.query:
+                bg_noise = request.query["bg_noise"]
+                query_params.append(f"bg_noise={bg_noise}")
+                logger.info(f"🔊 Background noise setting: {bg_noise}")
+            
+            if "noise_type" in request.query:
+                noise_type = request.query["noise_type"]
+                query_params.append(f"noise_type={noise_type}")
+                logger.info(f"🔊 Noise type: {noise_type}")
+            
+            if "noise_volume" in request.query:
+                noise_volume = request.query["noise_volume"]
+                query_params.append(f"noise_volume={noise_volume}")
+                logger.info(f"🔊 Noise volume: {noise_volume}")
+            
+            # Build the WebSocket URL with all parameters
+            ws_url = f"{CALLBACK_WS_URL}/?{'&'.join(query_params)}"
+            
+            # CRITICAL: Escape & characters for XML
+            ws_url_escaped = ws_url.replace('&', '&amp;')
+            
+            logger.info(f"📋 Generating Plivo XML for room: {room}")
+            logger.info(f"📋 Original WebSocket URL: {ws_url}")
+            logger.info(f"📋 XML-escaped WebSocket URL: {ws_url_escaped}")
+            
+            # Plivo XML response with properly escaped URL
             response_text = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Stream 
@@ -92,19 +132,29 @@ class HTTPServerManager:
         contentType="audio/x-mulaw;rate=8000"
         streamTimeout="3600"
         statusCallbackUrl="{request.url.scheme}://{request.host}/plivo-app/stream-status"
-    >{CALLBACK_WS_URL}/?room={room}</Stream>
+    >{ws_url_escaped}</Stream>
 </Response>"""
             
-            logger.info(f"📋 Returning Plivo XML for room: {room}")
+            logger.info(f"📋 Generated XML:")
+            for i, line in enumerate(response_text.split('\n'), 1):
+                if line.strip():  # Only log non-empty lines
+                    logger.info(f"📋 Line {i}: {line}")
+            
             return web.Response(text=response_text, content_type="text/xml")
             
         except Exception as e:
             logger.error(f"❌ Error generating Plivo XML: {e}")
-            return web.Response(
-                text="<?xml version='1.0' encoding='UTF-8'?><Response><Hangup/></Response>", 
-                content_type="text/xml", 
-                status=500
-            )
+            import traceback
+            traceback.print_exc()
+            
+            # Return simple fallback XML
+            fallback_xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Stream bidirectional="true" keepCallAlive="true" contentType="audio/x-mulaw;rate=8000">{CALLBACK_WS_URL}/?room={room}</Stream>
+</Response>"""
+            
+            logger.error(f"📋 Returning fallback XML: {fallback_xml}")
+            return web.Response(text=fallback_xml, content_type="text/xml")
 
     async def _handle_plivo_hangup(self, request):
         """Handle Plivo hangup callback"""
@@ -182,12 +232,50 @@ class HTTPServerManager:
             return web.json_response({"error": str(e)}, status=400)
     
     async def start_server(self):
-        """Start HTTP server"""
-        runner = web.AppRunner(self.app)
-        await runner.setup()
-        site = web.TCPSite(runner, HTTP_HOST, HTTP_PORT)
-        await site.start()
+        """Start HTTP server and wait for shutdown - FIXED VERSION"""
+        try:
+            # Setup the application runner
+            self.runner = web.AppRunner(self.app)
+            await self.runner.setup()
+            
+            # Create TCP site
+            self.site = web.TCPSite(self.runner, HTTP_HOST, HTTP_PORT)
+            await self.site.start()
+            
+            logger.info(f"🌐 HTTP server listening on http://{HTTP_HOST}:{HTTP_PORT}")
+            logger.info(f"📋 Plivo XML endpoint: http://{HTTP_HOST}:{HTTP_PORT}/plivo-app/plivo.xml")
+            logger.info(f"📞 Plivo hangup callback: http://{HTTP_HOST}:{HTTP_PORT}/plivo-app/hangup")
+            
+            # FIXED: Wait for shutdown signal instead of returning immediately
+            await self.shutdown_event.wait()
+            
+            # Cleanup
+            await self._cleanup()
+            
+        except Exception as e:
+            logger.error(f"❌ Error in HTTP server: {e}")
+            import traceback
+            traceback.print_exc()
+            raise
+    
+    def initiate_shutdown(self):
+        """Initiate HTTP server shutdown"""
+        logger.info("📶 HTTP server shutdown initiated")
+        self.shutdown_event.set()
+    
+    async def _cleanup(self):
+        """Cleanup HTTP server resources"""
+        logger.info("🧹 Cleaning up HTTP server...")
         
-        logger.info(f"🌐 HTTP server listening on http://{HTTP_HOST}:{HTTP_PORT}")
-        logger.info(f"📋 Plivo XML endpoint: http://{HTTP_HOST}:{HTTP_PORT}/plivo-app/plivo.xml")
-        logger.info(f"📞 Plivo hangup callback: http://{HTTP_HOST}:{HTTP_PORT}/plivo-app/hangup")
+        try:
+            if self.site:
+                await self.site.stop()
+                logger.info("✅ HTTP site stopped")
+            
+            if self.runner:
+                await self.runner.cleanup()
+                logger.info("✅ HTTP runner cleaned up")
+        except Exception as e:
+            logger.error(f"❌ Error cleaning up HTTP server: {e}")
+        
+        logger.info("✅ HTTP server cleanup complete")

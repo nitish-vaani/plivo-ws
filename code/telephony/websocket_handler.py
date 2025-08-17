@@ -1,5 +1,5 @@
 """
-Main WebSocket handler for telephony-LiveKit bridge
+Enhanced WebSocket handler with agent timeout and graceful shutdown
 """
 import asyncio
 import time
@@ -12,12 +12,13 @@ from audio.audio_processor import AudioProcessor
 from lk_utils.livekit_manager import LiveKitManager
 from agents.agent_manager import AgentManager
 from telephony.plivo_handler import PlivoMessageHandler
+from telephony.agent_monitor import AgentConnectionMonitor
 
 logger = logging.getLogger(__name__)
 
 
 class TelephonyWebSocketHandler:
-    """WebSocket handler for telephony system integration"""
+    """Enhanced WebSocket handler with agent timeout and graceful shutdown"""
     
     def __init__(self, room_name, websocket, agent_name=None, noise_settings=None):
         self.room_name = room_name
@@ -30,6 +31,9 @@ class TelephonyWebSocketHandler:
         self.agent_manager = AgentManager()
         self.plivo_handler = PlivoMessageHandler()
         self.audio_processor = AudioProcessor()
+        
+        # Agent monitoring
+        self.agent_monitor = None  # Will be created in initialize()
         
         # Apply noise settings if provided
         if noise_settings:
@@ -47,6 +51,10 @@ class TelephonyWebSocketHandler:
         self.audio_stream_task = None
         self.background_stream_task = None  # For continuous background audio
         self.agent_is_speaking = False      # Track agent speaking state
+        
+        # CLEANUP STATE - Critical for proper shutdown
+        self.cleanup_started = False
+        self.force_stop = False
         
         # Participant tracking
         self.agent_participant = None
@@ -73,13 +81,19 @@ class TelephonyWebSocketHandler:
             logger.info("🔇 Background noise disabled")
         
     async def initialize(self):
-        """Initialize the handler with concurrent setup"""
-        logger.info(f"🚀 Starting concurrent setup...")
+        """Initialize with dynamic agent timeout"""
+        logger.info(f"🚀 Starting concurrent setup with 5-second agent timeout...")
         
-        # Start all three tasks at the same time
+        # Create agent connection monitor
+        self.agent_monitor = AgentConnectionMonitor(self, timeout_seconds=5)
+        
+        # Start all tasks concurrently
         livekit_task = asyncio.create_task(self._setup_livekit())
         agent_task = asyncio.create_task(self.agent_manager.trigger_agent(self.room_name, self.agent_name))
         message_task = asyncio.create_task(self._handle_messages())
+        
+        # Start agent connection monitoring
+        monitor_task = asyncio.create_task(self.agent_monitor.start_monitoring())
         
         # Wait for LiveKit connection
         try:
@@ -91,14 +105,16 @@ class TelephonyWebSocketHandler:
         except asyncio.TimeoutError:
             logger.error("❌ LiveKit connection timeout (8s)")
         
-        # Agent task should complete quickly
+        # Wait for agent dispatch to complete
         try:
             await asyncio.wait_for(agent_task, timeout=2.0)
             logger.info("✅ Agent dispatch completed")
         except asyncio.TimeoutError:
             logger.warning("⚠️ Agent dispatch took longer than expected")
         
-        # Return the message handling task
+        logger.info("✅ Setup complete - monitoring for agent connection...")
+        
+        # Return the message task (the monitor runs independently)
         return message_task
     
     async def _setup_livekit(self):
@@ -210,7 +226,7 @@ class TelephonyWebSocketHandler:
                 self.audio_tracks[participant.identity].remove(track)
     
     def _handle_participant_joined(self, participant):
-        """Handle when a participant joins"""
+        """Handle when a participant joins - ENHANCED WITH MONITOR NOTIFICATION"""
         logger.info(f"🔍 Analyzing participant: {participant.identity}")
         
         # Store participant
@@ -221,6 +237,12 @@ class TelephonyWebSocketHandler:
         
         if is_agent:
             self.agent_participant = participant
+            
+            # CRITICAL: Notify the monitor that an agent connected
+            if hasattr(self, 'agent_monitor') and self.agent_monitor:
+                self.agent_monitor.notify_agent_connected()
+                logger.info("📢 Notified monitor: Agent connected!")
+            
             # Check if agent already has published audio tracks
             self._check_existing_agent_tracks(participant)
     
@@ -234,6 +256,11 @@ class TelephonyWebSocketHandler:
     
     def _start_agent_audio_stream(self, participant, track):
         """Start streaming agent audio to telephony"""
+        # Don't start if cleanup has begun
+        if self.cleanup_started or self.force_stop:
+            logger.info("🛑 Not starting agent stream - cleanup in progress")
+            return
+            
         # Cancel existing stream task if any
         if self.audio_stream_task and not self.audio_stream_task.done():
             logger.info("🔄 Cancelling existing audio stream task")
@@ -262,6 +289,11 @@ class TelephonyWebSocketHandler:
             logger.info("✅ AudioStream created successfully")
             
             async for audio_frame_event in audio_stream:
+                # CRITICAL: Check cleanup state first
+                if self.cleanup_started or self.force_stop:
+                    logger.info("🛑 Stopping agent audio stream - cleanup initiated")
+                    break
+                    
                 current_time = time.time()
                 
                 # Check if still connected
@@ -284,6 +316,11 @@ class TelephonyWebSocketHandler:
                     
                     # Send each audio chunk to telephony WITH background mixing
                     for clean_audio_chunk in telephony_audio_data:
+                        # Check again before sending
+                        if self.cleanup_started or self.force_stop:
+                            logger.info("🛑 Stopping mid-frame - cleanup initiated")
+                            break
+                            
                         # Mix clean agent audio with background for user
                         mixed_audio_chunk = self.audio_processor.mix_agent_audio_with_background(
                             clean_audio_chunk
@@ -313,6 +350,10 @@ class TelephonyWebSocketHandler:
     
     def _is_connection_active(self):
         """Check if connection is still active"""
+        # If cleanup started, connection is not active
+        if self.cleanup_started or self.force_stop:
+            return False
+            
         try:
             websocket_closed = (not hasattr(self.websocket, 'open') or 
                               not self.websocket.open if hasattr(self.websocket, 'open') else
@@ -326,11 +367,6 @@ class TelephonyWebSocketHandler:
         
         is_active = livekit_connected and not websocket_closed and call_active
         
-        # Log when connection becomes inactive
-        if not is_active:
-            logger.info(f"🔍 Connection inactive - LiveKit: {livekit_connected}, "
-                       f"WebSocket: {not websocket_closed}, Call: {call_active}")
-        
         return is_active
     
     async def _handle_messages(self):
@@ -339,6 +375,11 @@ class TelephonyWebSocketHandler:
         
         try:
             async for message in self.websocket:
+                # Check if cleanup started
+                if self.cleanup_started or self.force_stop:
+                    logger.info("🛑 Stopping message handling - cleanup initiated")
+                    break
+                    
                 await self.plivo_handler.handle_message(
                     message,
                     audio_callback=self._handle_audio_from_plivo,
@@ -352,10 +393,17 @@ class TelephonyWebSocketHandler:
             import traceback
             traceback.print_exc()
         finally:
-            await self.cleanup()
+            # Ensure cleanup runs when message loop ends
+            if not self.cleanup_started:
+                logger.info("🔄 Message loop ended - starting cleanup")
+                await self.cleanup()
     
     async def _handle_audio_from_plivo(self, audio_data):
         """Handle audio data from Plivo"""
+        # Don't process if cleanup started
+        if self.cleanup_started or self.force_stop:
+            return
+            
         if self.audio_source and self.livekit_manager.is_connected():
             if not self.audio_processor.validate_audio_data(audio_data):
                 return
@@ -388,7 +436,7 @@ class TelephonyWebSocketHandler:
         audio_frame_size = 80  # 10ms at 8kHz μ-law (80 bytes)
         
         try:
-            while self._is_connection_active():
+            while not self.cleanup_started and not self.force_stop and self._is_connection_active():
                 # Always send background audio when agent is NOT speaking
                 # When agent IS speaking, the mixed audio handles background
                 if not self.agent_is_speaking:
@@ -421,37 +469,61 @@ class TelephonyWebSocketHandler:
             await self.cleanup()
     
     async def cleanup(self):
-        """Clean up resources - ensures everything stops properly"""
-        logger.info("🧹 Starting comprehensive cleanup...")
+        """Enhanced cleanup with agent monitoring shutdown"""
+        if self.cleanup_started:
+            logger.info("🔄 Cleanup already in progress, skipping...")
+            return
+            
+        self.cleanup_started = True
+        self.force_stop = True
         
-        # Mark agent as not speaking and call as inactive
+        logger.info("🧹 Starting ENHANCED cleanup with monitor shutdown...")
+        
+        # STEP 1: Stop agent monitoring FIRST
+        if hasattr(self, 'agent_monitor') and self.agent_monitor:
+            logger.info("🔄 Stopping agent connection monitor...")
+            self.agent_monitor.stop_monitoring()
+        
+        # STEP 2: Immediately stop all audio processing
+        logger.info("🛑 Setting force stop flags...")
         self.agent_is_speaking = False
         
-        # STEP 1: Stop background audio immediately
-        logger.info("🔇 Stopping background audio...")
-        self.audio_processor.stop_background_audio()
+        # STEP 3: Stop background audio processor immediately
+        logger.info("🔇 Stopping background audio processor...")
+        if self.audio_processor:
+            self.audio_processor.stop()
         
-        # STEP 2: Cancel background streaming task first (most persistent)
+        # STEP 4: Cancel background streaming task first (most persistent)
         if self.background_stream_task and not self.background_stream_task.done():
             logger.info("🔄 Cancelling background audio stream task...")
             self.background_stream_task.cancel()
             try:
-                await asyncio.wait_for(self.background_stream_task, timeout=3.0)
-                logger.info("✅ Background stream task cancelled")
+                await asyncio.wait_for(self.background_stream_task, timeout=1.0)
+                logger.info("✅ Background stream task cancelled quickly")
             except (asyncio.CancelledError, asyncio.TimeoutError):
                 logger.info("⏰ Background stream task force cancelled")
         
-        # STEP 3: Cancel agent audio streaming task
+        # STEP 5: Cancel agent audio streaming task
         if self.audio_stream_task and not self.audio_stream_task.done():
             logger.info("🔄 Cancelling agent audio stream task...")
             self.audio_stream_task.cancel()
             try:
-                await asyncio.wait_for(self.audio_stream_task, timeout=2.0)
-                logger.info("✅ Agent stream task cancelled")
+                await asyncio.wait_for(self.audio_stream_task, timeout=1.0)
+                logger.info("✅ Agent stream task cancelled quickly")
             except (asyncio.CancelledError, asyncio.TimeoutError):
                 logger.info("⏰ Agent stream task force cancelled")
         
-        # STEP 4: Cleanup audio components
+        # STEP 6: Disconnect from LiveKit IMMEDIATELY - this should signal the agent
+        logger.info("🔗 Disconnecting from LiveKit to signal agent...")
+        try:
+            await asyncio.wait_for(self.livekit_manager.disconnect(), timeout=3.0)
+            logger.info("✅ LiveKit disconnected - agent should now know call ended")
+        except asyncio.TimeoutError:
+            logger.warning("⏰ LiveKit disconnect timed out - but agent should still get signal")
+        except Exception as e:
+            logger.error(f"❌ Error disconnecting from LiveKit: {e}")
+        
+        # STEP 7: Cleanup audio components
         cleanup_tasks = []
         
         if self.audio_source:
@@ -461,24 +533,15 @@ class TelephonyWebSocketHandler:
         
         if cleanup_tasks:
             try:
-                await asyncio.wait_for(asyncio.gather(*cleanup_tasks, return_exceptions=True), timeout=3.0)
+                await asyncio.wait_for(asyncio.gather(*cleanup_tasks, return_exceptions=True), timeout=2.0)
                 logger.info("✅ Audio components cleaned up")
             except asyncio.TimeoutError:
                 logger.warning("⏰ Audio cleanup timed out")
         
-        # STEP 5: Disconnect from LiveKit (this should stop the connection)
-        try:
-            await asyncio.wait_for(self.livekit_manager.disconnect(), timeout=5.0)
-            logger.info("✅ LiveKit disconnected successfully")
-        except asyncio.TimeoutError:
-            logger.warning("⏰ LiveKit disconnect timed out - forcing cleanup")
-        except Exception as e:
-            logger.error(f"❌ Error disconnecting from LiveKit: {e}")
-        
-        # STEP 6: Log final statistics
+        # STEP 8: Log final statistics
         await self._log_session_summary()
         
-        logger.info("✅ Comprehensive cleanup complete - all audio should be stopped")
+        logger.info("✅ ENHANCED cleanup complete - agent monitoring stopped, all audio stopped")
     
     async def _log_session_summary(self):
         """Log session summary statistics"""
