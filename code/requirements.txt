@@ -1,0 +1,9 @@
+asyncio
+websockets
+aiohttp
+livekit==1.0.9
+livekit-api
+numpy
+requests
+dotenv
+# librosa
