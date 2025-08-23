@@ -41,6 +41,7 @@ class HTTPServerManager:
         app.router.add_post("/plivo-app/stream-status", self._handle_stream_status)
         app.router.add_get("/plivo-app/stream-status", self._handle_stream_status)
         app.router.add_post("/plivo-app/trigger-call", self._handle_trigger_call)
+        app.router.add_get("/plivo-app/answer-and-dispatch", self._handle_answer_and_dispatch)
         
         return app
     
@@ -279,3 +280,109 @@ class HTTPServerManager:
             logger.error(f"❌ Error cleaning up HTTP server: {e}")
         
         logger.info("✅ HTTP server cleanup complete")
+
+    async def _handle_answer_and_dispatch(self, request):
+        """
+        Called by Plivo when customer answers outbound call.
+        Dispatches the agent and returns WebSocket streaming XML.
+        FIXED: Correct WebSocket URL and protocol
+        """
+        try:
+            import subprocess
+            import json
+            from urllib.parse import quote_plus
+            
+            # Extract parameters from query string
+            room = request.query.get("room")
+            agent = request.query.get("agent") 
+            call_db_id = request.query.get("call_db_id")
+            bg_noise = request.query.get("bg_noise", "true")
+            noise_type = request.query.get("noise_type", "call-center")
+            noise_volume = request.query.get("noise_volume", "0.15")
+            
+            if not room or not agent:
+                logger.error(f"❌ Missing required parameters: room={room}, agent={agent}")
+                return web.Response(text="Missing parameters", status=400)
+            
+            logger.info(f"🟢 Customer answered outbound call! Room: {room}, Agent: {agent}")
+            
+            # Get Plivo call parameters
+            plivo_call_uuid = request.query.get("CallUUID", "unknown")
+            from_number = request.query.get("From", "unknown") 
+            to_number = request.query.get("To", "unknown")
+            call_status = request.query.get("CallStatus", "unknown")
+            
+            logger.info(f"📞 Plivo Call Details:")
+            logger.info(f"   CallUUID: {plivo_call_uuid}")
+            logger.info(f"   From: {from_number}")
+            logger.info(f"   To: {to_number}")
+            logger.info(f"   Status: {call_status}")
+            
+            # Step 1: Dispatch agent NOW (customer has answered)
+            metadata = {
+                "direction": "inbound",
+                "phone": to_number,
+                "from": from_number,
+                "plivo_call_uuid": plivo_call_uuid,
+                "agent_name": agent,
+                "room": room,
+                "call_type": "outbound_answered"
+            }
+            
+            metadata_json = json.dumps(metadata)
+            
+            logger.info(f"🤖 Dispatching agent '{agent}' to room '{room}'...")
+            agent_process = subprocess.Popen([
+                "lk", "dispatch", "create",
+                "--room", room,
+                "--agent-name", agent,
+                "--metadata", metadata_json
+            ], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            
+            logger.info(f"✅ Agent '{agent}' dispatched to room '{room}' (PID: {agent_process.pid})")
+            
+            # Step 2: Build WebSocket URL with CORRECT URL and protocol
+            # URL-encode each parameter value
+            room_encoded = quote_plus(room)
+            agent_encoded = quote_plus(agent)
+            bg_noise_encoded = quote_plus(bg_noise)
+            noise_type_encoded = quote_plus(noise_type)
+            noise_volume_encoded = quote_plus(noise_volume)
+            
+            # FIXED: Use correct WebSocket URL and WSS protocol
+            ws_url = f"wss://pacewisdom-ws.vaaniresearch.com/plivo-ws/?room={room_encoded}&agent={agent_encoded}&bg_noise={bg_noise_encoded}&noise_type={noise_type_encoded}&noise_volume={noise_volume_encoded}"
+            
+            # XML-escape the URL for use in XML (& becomes &amp;)
+            ws_url_escaped = ws_url.replace('&', '&amp;')
+            
+            logger.info(f"🔗 WebSocket URL (raw): {ws_url}")
+            logger.info(f"🔗 WebSocket URL (XML-escaped): {ws_url_escaped}")
+            
+            # Step 3: Return XML for WebSocket streaming
+            response_text = f"""<?xml version="1.0" encoding="UTF-8"?>
+    <Response>
+        <Stream 
+            bidirectional="true" 
+            keepCallAlive="true" 
+            contentType="audio/x-mulaw;rate=8000"
+            streamTimeout="3600"
+            statusCallbackUrl="https://pacewisdom-ws.vaaniresearch.com/plivo-app/stream-status?call_db_id={call_db_id}"
+        >{ws_url_escaped}</Stream>
+    </Response>"""
+            
+            logger.info(f"📋 Returning XML for answered call - WebSocket streaming initiated")
+            logger.info(f"🎯 Expected flow: Customer connected → Agent dispatched → WebSocket bridges audio")
+            
+            return web.Response(text=response_text, content_type="text/xml")
+            
+        except Exception as e:
+            logger.error(f"❌ Error in answer-and-dispatch: {e}")
+            import traceback
+            traceback.print_exc()
+            
+            # Return simple hangup XML on error
+            fallback_xml = """<?xml version="1.0" encoding="UTF-8"?>
+    <Response>
+        <Hangup/>
+    </Response>"""
+            return web.Response(text=fallback_xml, content_type="text/xml")  
