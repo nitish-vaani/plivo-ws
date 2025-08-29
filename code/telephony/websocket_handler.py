@@ -137,6 +137,7 @@ class TelephonyWebSocketHandler:
             # Create and publish audio track
             await self._setup_audio_track()
             logger.info(f"🎯 LiveKit connection complete - ready for audio!")
+            logger.info(f"🎯 LiveKit ready in {time.time() - self.connection_start_time:.2f}s")
         
         return success
     
@@ -174,6 +175,24 @@ class TelephonyWebSocketHandler:
         logger.info(f"👤 NEW participant joined: {participant.identity}")
         self._handle_participant_joined(participant)
     
+    # def _on_participant_disconnected(self, participant):
+    #     """Handle participant disconnection"""
+    #     logger.info(f"👋 Participant left: {participant.identity}")
+        
+    #     # Clean up tracking
+    #     if participant.identity in self.participants:
+    #         del self.participants[participant.identity]
+    #     if participant.identity in self.audio_tracks:
+    #         del self.audio_tracks[participant.identity]
+        
+    #     if participant == self.agent_participant:
+    #         logger.warning("🤖 AGENT PARTICIPANT DISCONNECTED!")
+    #         self.agent_participant = None
+    #         # Cancel audio streaming task
+    #         if self.audio_stream_task and not self.audio_stream_task.done():
+    #             logger.info("🔄 Cancelling audio stream task due to agent disconnect")
+    #             self.audio_stream_task.cancel()
+    
     def _on_participant_disconnected(self, participant):
         """Handle participant disconnection"""
         logger.info(f"👋 Participant left: {participant.identity}")
@@ -187,11 +206,43 @@ class TelephonyWebSocketHandler:
         if participant == self.agent_participant:
             logger.warning("🤖 AGENT PARTICIPANT DISCONNECTED!")
             self.agent_participant = None
+            
+            # 🆕 NEW: End user's call immediately when agent disconnects
+            logger.info("📞 Agent disconnected - ending call for user immediately")
+            asyncio.create_task(self._end_user_call_due_to_agent_disconnect())
+            
             # Cancel audio streaming task
             if self.audio_stream_task and not self.audio_stream_task.done():
                 logger.info("🔄 Cancelling audio stream task due to agent disconnect")
                 self.audio_stream_task.cancel()
-    
+
+
+    async def _end_user_call_due_to_agent_disconnect(self):
+        """End user's call when agent disconnects"""
+        try:
+            logger.info("🔚 Ending Plivo call due to agent disconnect")
+            
+            # Close the WebSocket connection to Plivo - this ends the user's call
+            if hasattr(self, 'websocket') and self.websocket:
+                try:
+                    if not self.websocket.closed:
+                        await self.websocket.close(code=1000, reason="Agent disconnected")
+                        logger.info("✅ WebSocket closed - user call ended")
+                    else:
+                        logger.info("ℹ️ WebSocket already closed")
+                except Exception as e:
+                    logger.error(f"❌ Error closing WebSocket: {e}")
+            
+            # Trigger cleanup to ensure everything is cleaned up properly
+            if not self.cleanup_started:
+                logger.info("🧹 Triggering cleanup after agent disconnect")
+                await self.cleanup()
+                
+        except Exception as e:
+            logger.error(f"❌ Error ending user call due to agent disconnect: {e}")
+
+
+
     def _on_track_published(self, publication, participant):
         """Handle track publication"""
         logger.info(f"📡 Track PUBLISHED by {participant.identity}: {publication.kind}")

@@ -18,3 +18,25 @@ services:
       deploy:
         restart_policy:
           condition: on-failure
+
+
+    maqsam_ws:
+      container_name: maqsam_ws
+      # build:
+      #   context: .
+        # dockerfile: ./local/Dockerfiles/Dockerfile.nginx
+      image: python:3.10
+        
+      ports:
+        - "8080:8080"
+        - "8765:8765"
+      volumes:
+        - ./code/:/app
+
+      command: tail -f /dev/null
+      deploy:
+        restart_policy:
+          condition: on-failure
+
+
+    

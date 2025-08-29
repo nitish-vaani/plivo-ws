@@ -5,6 +5,9 @@ import asyncio
 import time
 import uuid
 import logging
+import subprocess
+import json
+
 from aiohttp import web
 from config import (
     TELEPHONY_SAMPLE_RATE, LIVEKIT_SAMPLE_RATE, CALLBACK_WS_URL,
@@ -85,6 +88,22 @@ class HTTPServerManager:
         try:
             # Get room name from query parameters
             room = request.query.get("room", f"plivo-room-{uuid.uuid4()}")
+            agent_name = request.query.get("agent", "Mysyara Agent")
+            # if agent_name:
+            #     metadata = {
+            #         "direction": "inbound",
+            #         "phone": request.query.get("From", "unknown"),  # Caller's number
+            #         "call_type": "inbound"
+            #     }
+                
+            #     # Fire and forget
+            #     subprocess.Popen([
+            #         "lk", "dispatch", "create",
+            #         "--room", room,
+            #         "--agent-name", agent_name,
+            #         "--metadata", json.dumps(metadata)
+            #     ])
+            #     logger.info(f"🤖 Dispatched agent for INBOUND call to room: {room}")
             
             # Get ALL query parameters to pass to WebSocket
             query_params = []
@@ -312,11 +331,6 @@ class HTTPServerManager:
             to_number = request.query.get("To", "unknown")
             call_status = request.query.get("CallStatus", "unknown")
             
-            logger.info(f"📞 Plivo Call Details:")
-            logger.info(f"   CallUUID: {plivo_call_uuid}")
-            logger.info(f"   From: {from_number}")
-            logger.info(f"   To: {to_number}")
-            logger.info(f"   Status: {call_status}")
             
             # Step 1: Dispatch agent NOW (customer has answered)
             metadata = {
@@ -338,6 +352,12 @@ class HTTPServerManager:
                 "--agent-name", agent,
                 "--metadata", metadata_json
             ], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+            logger.info(f"📞 Plivo Call Details:")
+            logger.info(f"   CallUUID: {plivo_call_uuid}")
+            logger.info(f"   From: {from_number}")
+            logger.info(f"   To: {to_number}")
+            logger.info(f"   Status: {call_status}")
             
             logger.info(f"✅ Agent '{agent}' dispatched to room '{room}' (PID: {agent_process.pid})")
             

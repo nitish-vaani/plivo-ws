@@ -65,40 +65,70 @@ class AgentConnectionMonitor:
             logger.error(f"❌ Error in agent connection monitoring: {e}")
             return False
     
+    # async def _drop_call_no_agent(self):
+    #     """Drop the call because no agent connected"""
+    #     logger.info("📞 Dropping call - no agent available")
+        
+    #     try:
+    #         # Send a message to Plivo that no agent is available (optional)
+    #         if (hasattr(self.websocket_handler, 'websocket') and 
+    #             hasattr(self.websocket_handler.websocket, 'send')):
+    #             try:
+    #                 logger.info("📢 Notifying caller that no agent is available")
+    #                 # You could implement a brief audio message here if needed
+                    
+    #             except Exception as e:
+    #                 logger.error(f"❌ Error sending no-agent message: {e}")
+            
+    #         # Close the WebSocket connection cleanly
+    #         if hasattr(self.websocket_handler, 'websocket'):
+    #             try:
+    #                 await self.websocket_handler.websocket.close(
+    #                     code=1000, 
+    #                     reason="No agent available"
+    #                 )
+    #                 logger.info("✅ WebSocket closed - no agent available")
+    #             except Exception as e:
+    #                 logger.error(f"❌ Error closing WebSocket: {e}")
+            
+    #         # Trigger cleanup of the handler
+    #         if hasattr(self.websocket_handler, 'cleanup'):
+    #             logger.info("🧹 Triggering handler cleanup due to no agent")
+    #             await self.websocket_handler.cleanup()
+                
+    #     except Exception as e:
+    #         logger.error(f"❌ Error dropping call: {e}")
+    
     async def _drop_call_no_agent(self):
         """Drop the call because no agent connected"""
-        logger.info("📞 Dropping call - no agent available")
+        logger.info("📞 Agent connection timeout - ending call for user immediately")
         
         try:
-            # Send a message to Plivo that no agent is available (optional)
+            # Close the WebSocket connection cleanly - this ends user's call
             if (hasattr(self.websocket_handler, 'websocket') and 
-                hasattr(self.websocket_handler.websocket, 'send')):
+                self.websocket_handler.websocket):
                 try:
-                    logger.info("📢 Notifying caller that no agent is available")
-                    # You could implement a brief audio message here if needed
-                    
-                except Exception as e:
-                    logger.error(f"❌ Error sending no-agent message: {e}")
-            
-            # Close the WebSocket connection cleanly
-            if hasattr(self.websocket_handler, 'websocket'):
-                try:
-                    await self.websocket_handler.websocket.close(
-                        code=1000, 
-                        reason="No agent available"
-                    )
-                    logger.info("✅ WebSocket closed - no agent available")
+                    if not self.websocket_handler.websocket.closed:
+                        await self.websocket_handler.websocket.close(
+                            code=1000, 
+                            reason="No agent available - timeout"
+                        )
+                        logger.info("✅ WebSocket closed - user call ended due to agent timeout")
+                    else:
+                        logger.info("ℹ️ WebSocket already closed")
                 except Exception as e:
                     logger.error(f"❌ Error closing WebSocket: {e}")
             
             # Trigger cleanup of the handler
             if hasattr(self.websocket_handler, 'cleanup'):
-                logger.info("🧹 Triggering handler cleanup due to no agent")
-                await self.websocket_handler.cleanup()
-                
+                logger.info("🧹 Triggering handler cleanup due to agent timeout")
+                if not self.websocket_handler.cleanup_started:
+                    await self.websocket_handler.cleanup()
+                    
         except Exception as e:
-            logger.error(f"❌ Error dropping call: {e}")
-    
+            logger.error(f"❌ Error dropping call due to agent timeout: {e}")
+
+
     def notify_agent_connected(self):
         """Called when an agent connects"""
         if not self.timeout_reached and self.monitoring_active:
