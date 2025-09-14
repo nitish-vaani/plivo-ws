@@ -175,23 +175,6 @@ class TelephonyWebSocketHandler:
         logger.info(f"👤 NEW participant joined: {participant.identity}")
         self._handle_participant_joined(participant)
     
-    # def _on_participant_disconnected(self, participant):
-    #     """Handle participant disconnection"""
-    #     logger.info(f"👋 Participant left: {participant.identity}")
-        
-    #     # Clean up tracking
-    #     if participant.identity in self.participants:
-    #         del self.participants[participant.identity]
-    #     if participant.identity in self.audio_tracks:
-    #         del self.audio_tracks[participant.identity]
-        
-    #     if participant == self.agent_participant:
-    #         logger.warning("🤖 AGENT PARTICIPANT DISCONNECTED!")
-    #         self.agent_participant = None
-    #         # Cancel audio streaming task
-    #         if self.audio_stream_task and not self.audio_stream_task.done():
-    #             logger.info("🔄 Cancelling audio stream task due to agent disconnect")
-    #             self.audio_stream_task.cancel()
     
     def _on_participant_disconnected(self, participant):
         """Handle participant disconnection"""
@@ -420,21 +403,51 @@ class TelephonyWebSocketHandler:
         
         return is_active
     
+    # async def _handle_messages(self):
+    #     """Handle incoming WebSocket messages from Plivo"""
+    #     logger.info(f"👂 Starting to listen for Plivo WebSocket messages...")
+        
+    #     try:
+    #         async for message in self.websocket:
+    #             # Check if cleanup started
+    #             if self.cleanup_started or self.force_stop:
+    #                 logger.info("🛑 Stopping message handling - cleanup initiated")
+    #                 break
+                    
+    #             await self.plivo_handler.handle_message(
+    #                 message,
+    #                 audio_callback=self._handle_audio_from_plivo,
+    #                 event_callback=self._handle_plivo_event
+    #             )
+                        
+    #     except websockets.ConnectionClosed:
+    #         logger.info("📞 Plivo WebSocket connection closed normally")
+    #     except Exception as e:
+    #         logger.error(f"❌ Error handling Plivo messages: {e}")
+    #         import traceback
+    #         traceback.print_exc()
+    #     finally:
+    #         # Ensure cleanup runs when message loop ends
+    #         if not self.cleanup_started:
+    #             logger.info("🔄 Message loop ended - starting cleanup")
+    #             await self.cleanup()
+    
     async def _handle_messages(self):
         """Handle incoming WebSocket messages from Plivo"""
         logger.info(f"👂 Starting to listen for Plivo WebSocket messages...")
         
         try:
             async for message in self.websocket:
-                # Check if cleanup started
                 if self.cleanup_started or self.force_stop:
                     logger.info("🛑 Stopping message handling - cleanup initiated")
                     break
                     
+                # Pass self to the handler so it can access room_name and agent_name
                 await self.plivo_handler.handle_message(
                     message,
                     audio_callback=self._handle_audio_from_plivo,
-                    event_callback=self._handle_plivo_event
+                    event_callback=self._handle_plivo_event,
+                    websocket_handler=self  # NEW: Pass self for database creation
                 )
                         
         except websockets.ConnectionClosed:
@@ -444,11 +457,11 @@ class TelephonyWebSocketHandler:
             import traceback
             traceback.print_exc()
         finally:
-            # Ensure cleanup runs when message loop ends
             if not self.cleanup_started:
                 logger.info("🔄 Message loop ended - starting cleanup")
                 await self.cleanup()
-    
+
+
     async def _handle_audio_from_plivo(self, audio_data):
         """Handle audio data from Plivo"""
         # Don't process if cleanup started

@@ -5,6 +5,8 @@ import json
 import base64
 import logging
 from config import TELEPHONY_SAMPLE_RATE, MESSAGE_LOG_FREQUENCY
+import os
+import aiohttp
 
 logger = logging.getLogger(__name__)
 
@@ -17,39 +19,69 @@ class PlivoMessageHandler:
         self.call_active = False
         self.messages_received = 0
         self.messages_sent = 0
+        self.call_db_id = None
+        self.api_base_url = os.environ.get("INCOMING_CALL_AGENT_BACKEND_API", None)
     
-    async def handle_message(self, message, audio_callback=None, event_callback=None):
-        """Handle incoming WebSocket message from Plivo"""
+    # async def handle_message(self, message, audio_callback=None, event_callback=None):
+    #     """Handle incoming WebSocket message from Plivo"""
+    #     self.messages_received += 1
+        
+    #     try:
+    #         if isinstance(message, str):
+    #             event = json.loads(message)
+    #             await self._handle_telephony_event(event, audio_callback, event_callback)
+    #         else:
+    #             # Handle binary audio data directly
+    #             if audio_callback:
+    #                 await audio_callback(message)
+                    
+    #     except json.JSONDecodeError as e:
+    #         logger.error(f"❌ Invalid JSON from Plivo: {e}")
+    #         logger.error(f"Message content: {message[:100]}...")
+    
+    async def handle_message(self, message, audio_callback=None, event_callback=None, websocket_handler=None):
+        """Handle incoming WebSocket message - UPDATED to pass handler"""
         self.messages_received += 1
         
         try:
             if isinstance(message, str):
                 event = json.loads(message)
-                await self._handle_telephony_event(event, audio_callback, event_callback)
+                await self._handle_telephony_event(event, audio_callback, event_callback, websocket_handler)
             else:
-                # Handle binary audio data directly
                 if audio_callback:
                     await audio_callback(message)
                     
         except json.JSONDecodeError as e:
             logger.error(f"❌ Invalid JSON from Plivo: {e}")
-            logger.error(f"Message content: {message[:100]}...")
+
+    # async def _handle_telephony_event(self, event, audio_callback=None, event_callback=None):
+    #     """Handle Plivo WebSocket events"""
+    #     event_type = event.get("event")
+        
+    #     if event_type == "start":
+    #         await self._handle_start_event(event)
+    #     elif event_type == "media":
+    #         await self._handle_media_event(event, audio_callback)
+    #     elif event_type == "stop":
+    #         await self._handle_stop_event(event, event_callback)
+    #     else:
+    #         logger.info(f"❓ Unknown Plivo event: {event_type}")
+    #         logger.info(f"📄 Event data: {json.dumps(event, indent=2)}")
     
-    async def _handle_telephony_event(self, event, audio_callback=None, event_callback=None):
-        """Handle Plivo WebSocket events"""
+    async def _handle_telephony_event(self, event, audio_callback=None, event_callback=None, websocket_handler=None):
+        """Handle Plivo WebSocket events - UPDATED"""
         event_type = event.get("event")
         
         if event_type == "start":
-            await self._handle_start_event(event)
+            await self._handle_start_event(event, websocket_handler)
         elif event_type == "media":
             await self._handle_media_event(event, audio_callback)
         elif event_type == "stop":
             await self._handle_stop_event(event, event_callback)
         else:
             logger.info(f"❓ Unknown Plivo event: {event_type}")
-            logger.info(f"📄 Event data: {json.dumps(event, indent=2)}")
-    
-    async def _handle_start_event(self, event):
+
+    async def _handle_start_event(self, event, websocket_handler=None):
         """Handle call start event"""
         logger.info("🟢 CALL STARTED")
         self.call_active = True
@@ -57,7 +89,12 @@ class PlivoMessageHandler:
         start_data = event.get("start", {})
         self.stream_sid = start_data.get("streamId")
         call_id = start_data.get("callId")
+        account_id = start_data.get("accountId")
+        from_number = start_data.get("from")  # Caller's number
+        to_number = start_data.get("to")     
+
         
+        logger.info(f"📊 From: {from_number} → To: {to_number}")
         logger.info(f"📊 Stream ID: {self.stream_sid}")
         logger.info(f"📊 Call ID: {call_id}")
         logger.info(f"📊 Account ID: {start_data.get('accountId')}")
@@ -70,6 +107,47 @@ class PlivoMessageHandler:
         else:
             logger.error(f"❌ CRITICAL: No stream ID found in start event!")
             logger.error(f"❌ Start data keys: {list(start_data.keys())}")
+
+        if call_id and websocket_handler:
+            await self._create_inbound_call_record(
+                call_uuid=call_id,
+                from_number=from_number,
+                to_number=to_number,
+                room_name=websocket_handler.room_name,
+                agent_name=websocket_handler.agent_name
+            )
+
+    async def _create_inbound_call_record(self, call_uuid, from_number, to_number, room_name, agent_name):
+        """Create database record for inbound call"""
+        try:
+            logger.info(f"📝 Creating database record for inbound call: {call_uuid}")
+            
+            call_data = {
+                "call_uuid": call_uuid,
+                "from_number": from_number,
+                "to_number": to_number,
+                "room_name": room_name,
+                "agent_name": agent_name or "Mysyara Agent",
+                "caller_name": f"Caller {from_number[-4:]}"  # Last 4 digits
+            }
+
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{self.api_base_url}/api/create-inbound-call/",
+                    json=call_data,
+                    timeout=aiohttp.ClientTimeout(total=10)
+                ) as response:
+                    
+                    if response.status == 200:
+                        result = await response.json()
+                        self.call_db_id = result.get("call_db_id")
+                        logger.info(f"✅ Inbound call record created: DB ID {self.call_db_id}")
+                    else:
+                        error_text = await response.text()
+                        logger.error(f"❌ Failed to create call record: {response.status} - {error_text}")
+                        
+        except Exception as e:
+            logger.error(f"❌ Error creating inbound call record: {e}")
     
     async def _handle_media_event(self, event, audio_callback=None):
         """Handle media/audio event"""

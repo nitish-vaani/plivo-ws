@@ -45,6 +45,7 @@ class HTTPServerManager:
         app.router.add_get("/plivo-app/stream-status", self._handle_stream_status)
         app.router.add_post("/plivo-app/trigger-call", self._handle_trigger_call)
         app.router.add_get("/plivo-app/answer-and-dispatch", self._handle_answer_and_dispatch)
+        app.router.add_post("/plivo-app/transfer-xml", self._handle_transfer_xml)
         
         return app
     
@@ -87,23 +88,13 @@ class HTTPServerManager:
         """Return Plivo XML for call flow - FIXED TO PASS ALL PARAMETERS"""
         try:
             # Get room name from query parameters
+
+            logger.info("###############_handle_plivo_xml#############")
+            logger.info(f"Request is {request}")
+            logger.info("############################")
+
             room = request.query.get("room", f"plivo-room-{uuid.uuid4()}")
             agent_name = request.query.get("agent", "Mysyara Agent")
-            # if agent_name:
-            #     metadata = {
-            #         "direction": "inbound",
-            #         "phone": request.query.get("From", "unknown"),  # Caller's number
-            #         "call_type": "inbound"
-            #     }
-                
-            #     # Fire and forget
-            #     subprocess.Popen([
-            #         "lk", "dispatch", "create",
-            #         "--room", room,
-            #         "--agent-name", agent_name,
-            #         "--metadata", json.dumps(metadata)
-            #     ])
-            #     logger.info(f"🤖 Dispatched agent for INBOUND call to room: {room}")
             
             # Get ALL query parameters to pass to WebSocket
             query_params = []
@@ -235,6 +226,9 @@ class HTTPServerManager:
         """Trigger a new call via Plivo API - for testing purposes"""
         try:
             data = await request.json()
+            logger.info("###############Handle_Trigger_call#############")
+            logger.info(f"Request is {request}")
+            logger.info("############################")
             to_number = data["to"]
             from_number = data["from"] 
             room = data.get("room", f"plivo-room-{uuid.uuid4()}")
@@ -406,3 +400,69 @@ class HTTPServerManager:
         <Hangup/>
     </Response>"""
             return web.Response(text=fallback_xml, content_type="text/xml")  
+
+    # async def _handle_transfer_xml(self, request):
+    #     """XML endpoint for transfers - shared by all clients"""
+    #     try:
+    #         to_number = request.query.get("to")
+    #         from_number = request.query.get("from")
+    #         to = to_number.strip()
+    #         from_ = from_number.strip()
+            
+    #         logger.info(f"📞 Transfer XML requested: {from_} → {to}")
+            
+    #         transfer_xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+    # <Response>
+    #     <Dial 
+    #         callerId="{from_number}"
+    #         timeout="30"
+    #         timeLimit="3600"
+    #         hangupOnStar="true"
+    #     >
+    #         <Number>{to_number}</Number>
+    #     </Dial>
+    # </Response>"""
+            
+    #         return web.Response(text=transfer_xml, content_type="text/xml")
+
+    #     except Exception as e:
+    #         logger.error(f"❌ Transfer XML error: {e}")
+    #         return web.Response(
+    #             text='<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>',
+    #             content_type="text/xml"
+    #         )
+
+
+    async def _handle_transfer_xml(self, request):
+        """XML endpoint for transfers - shared by all clients"""
+        try:
+            to_number = request.query.get("to")
+            from_number = request.query.get("from")
+
+            # Clean inputs
+            to = to_number.strip()
+            from_ = from_number.strip()
+
+            logger.info(f"📞 Transfer XML requested: {from_} → {to}")
+
+            transfer_xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+    <Response>
+        <Dial 
+            callerId="{from_}"
+            timeout="30"
+            timeLimit="3600"
+            hangupOnStar="true"
+        >
+            <Number>{to}</Number>
+        </Dial>
+    </Response>"""
+
+            return web.Response(text=transfer_xml, content_type="text/xml")
+
+        except Exception as e:
+            logger.error(f"❌ Transfer XML error: {e}")
+            return web.Response(
+                text='<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>',
+                content_type="text/xml"
+            )
+
